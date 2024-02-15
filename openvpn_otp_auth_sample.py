@@ -16,13 +16,15 @@ import sqlite3
 import sys
 
 import pyotp
+import bcrypt
+import getpass
 
 # XXX Put this somewhere in more secure place
 USER_SECRETS = {'userX': {'password': 'XXX', 'otp_secret': 'XXX'}}
 # To generate a secret, see https://pyotp.readthedocs.io/en/latest/
 
 SESSION_DURATION = 164  # hours (1 week)
-DB_FILE = '/opt/openvpn/sessions.db'
+DB_FILE = '/tmp/openvpn-sessions.db'
 DB_SCHEMA = '''
     CREATE TABLE sessions (
         username VARCHAR PRIMARY KEY,
@@ -52,7 +54,7 @@ def main():
         # print(username, password, otp)
 
         # Verify password.
-        if password != USER_SECRETS[username]['password']:
+        if not bcrypt.checkpw(password.encode('utf-8'), USER_SECRETS[username]['password'].encode('utf-8')):   
             print(f'>> Bad password provided by user {username}.')
             sys.exit(3)
 
@@ -142,7 +144,7 @@ def store_session(username, vpn_client, current_ip, created):
     """Store session record into sqlite."""
     db, cursor = get_db_cursor()
     cursor.execute('''REPLACE INTO sessions (username, vpn_client, ip_address, verified_on)
-                      VALUES (?,?,?,?,?)''', (username, vpn_client, current_ip, created))
+                      VALUES (?,?,?,?)''', (username, vpn_client, current_ip, created))
     db.commit()
 
 
@@ -153,6 +155,32 @@ def get_session(username):
     session = cursor.fetchone()
     return session
 
+def read_password(help_text='Password:'):
+    """
+    Read password from stdin
+    """
+    
+    while True:
+        if help_text:
+            print (help_text)
+        pw = getpass.getpass()
+        if pw:
+            break
+    return pw
 
 if __name__ == '__main__':
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--genkey":
+        username = str(sys.argv[2])
+        password = read_password('Enter Password:')        
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+		b32 = pyotp.random_base32()
+        totp = pyotp.totp.TOTP(b32)
+        print(username)
+        print(hashed)
+        print(b32)
+        #print(totp.provisioning_uri(username, issuer_name=serverName))
+        exit(0)
+   
     main()
+    
