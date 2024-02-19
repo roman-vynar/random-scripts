@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
+
 """OpenVPN OTP auth script.
 
 This script is run on OpenVPN control channel renegotiation.
 Use cases:
 1. initial connect or after manual disconnect - a new OTP session record is created in sqlite.
+ we do this in /tmp to avoid writes on the flash
 2. on reconnect - an user session is validated.
 
-Supports TOTP to use with Google Authenticator.
+Supports TOTP!
 Retrieves user info from os.environ and username/password/OTP from file passed as the first arg.
+```
+auth-user-pass-verify openvpn_otp_auth.py via-file
+```
+
+./sciptname.py --genkey <username>
+asks for password input via stdin and outputs
+username,password bcrypt hash und otp private key
+
+To add a new user, just add a new line into USER_SECRETS
+
 """
 import base64
 import datetime
@@ -19,13 +31,14 @@ import pyotp
 import bcrypt
 import getpass
 
-# XXX Put this somewhere in more secure place
-USER_SECRETS = {'userX': {'password': 'XXX', 'otp_secret': 'XXX'}}
-# To generate a secret, see https://pyotp.readthedocs.io/en/latest/
+USER_SECRETS = {'usera':   {'password': '$2b$12$KvKrkx4yRPW8GzyeyYFSlO5AsbJm1MfuFEDT47Xb4/ev08orDk3t2', 'otp_secret': 'J26SCGVM5JR5YCOLB7WXSTIXRRMZUXGH'},
+                'userb':   {'password': '$2b$12$KvKrkx4yRPW8GzyeyYFSlO5AsbJm1MfuFEDT47Xb4/ev08orDk3t2', 'otp_secret': '6JG6YRJSSSNQV2TKFCTAK4ZWCKGATNMF'}
+}
 
-SESSION_DURATION = 164  # hours (1 week)
+
+SESSION_DURATION = 49  # hours (2 days)
 DB_FILE = '/tmp/openvpn-sessions.db'
-DB_SCHEMA = '''
+DB_SCHEMA_SESSION = '''
     CREATE TABLE sessions (
         username VARCHAR PRIMARY KEY,
         vpn_client VARCHAR,
@@ -33,7 +46,14 @@ DB_SCHEMA = '''
         verified_on TIMESTAMP
     )
 '''
-
+DB_SCHEMA_OTPS='''
+    ;
+    CREATE TABLE otps (
+        username VARCHAR,
+        used TIMESTAMP,
+        otp VARCHAR
+    )
+'''
 
 def main():
     """Main func."""
@@ -51,12 +71,16 @@ def main():
         # Initial connect or full re-connect phase.
         password = base64.b64decode(password_data[1]).decode()
         otp = base64.b64decode(password_data[2]).decode()
-        # print(username, password, otp)
 
         # Verify password.
-        if not bcrypt.checkpw(password.encode('utf-8'), USER_SECRETS[username]['password'].encode('utf-8')):   
+        #if password != USER_SECRETS[username]['password']:
+        if not bcrypt.checkpw(password.encode('utf-8'), USER_SECRETS[username]['password'].encode('utf-8')):
             print(f'>> Bad password provided by user {username}.')
             sys.exit(3)
+
+        if get_last_otps(username,otp) >= 1:
+            print(f'>> OTP Value {otp} for user {username}  is already been used')
+            sys.exit(4)
 
         # Verify OTP, no matter if we have a valid OTP user session as the user is prompted for OTP anyway.
         if not verify_totp(USER_SECRETS[username]['otp_secret'], otp):
@@ -88,7 +112,7 @@ def verify_totp(secret, otp):
 
 def create_session(username):
     """Create/update user OTP session."""
-    vpn_client = os.environ['IV_GUI_VER']
+    vpn_client = os.environ['IV_VER']
     current_ip = os.environ['untrusted_ip']
     created = datetime.datetime.now()
 
@@ -129,9 +153,10 @@ def validate_session(username):
 def get_db_cursor():
     """Connect to sqlite db file."""
     if not os.path.exists(DB_FILE):
-        db = sqlite3.connect(DB_FILE)
+        db = sqlite3.connect(DB_FILE,timeout=30.0)
         cursor = db.cursor()
-        cursor.execute(DB_SCHEMA)
+        cursor.execute(DB_SCHEMA_SESSION)
+        cursor.execute(DB_SCHEMA_OTPS)
         db.commit()
     else:
         db = sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
@@ -146,6 +171,7 @@ def store_session(username, vpn_client, current_ip, created):
     cursor.execute('''REPLACE INTO sessions (username, vpn_client, ip_address, verified_on)
                       VALUES (?,?,?,?)''', (username, vpn_client, current_ip, created))
     db.commit()
+    db.close()
 
 
 def get_session(username):
@@ -153,13 +179,29 @@ def get_session(username):
     _, cursor = get_db_cursor()
     cursor.execute('''SELECT vpn_client, ip_address, verified_on FROM sessions WHERE username=?''', (username,))
     session = cursor.fetchone()
+    cursor.close()
     return session
+
+
+def get_last_otps(username,otp):
+    """Get session record from sqlite."""
+    db, cursor = get_db_cursor()
+
+    cursor.execute("delete from otps where datetime(used) < datetime(current_timestamp, '-5 minutes')")
+    db.commit()
+
+    cursor.execute("SELECT count(*) AS ANZAHL from otps where datetime(used) >= datetime(current_timestamp, '-2 minutes') and username=? and otp=?",(username,otp))
+    last_otps = cursor.fetchone()
+    db.commit()
+    db.close()
+    return last_otps[0]
+
 
 def read_password(help_text='Password:'):
     """
     Read password from stdin
     """
-    
+
     while True:
         if help_text:
             print (help_text)
@@ -172,15 +214,16 @@ if __name__ == '__main__':
 
     if len(sys.argv) == 3 and sys.argv[1] == "--genkey":
         username = str(sys.argv[2])
-        password = read_password('Enter Password:')        
+        password = read_password('Enter Password:')
         hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-		b32 = pyotp.random_base32()
+
+		# Gen key for user, store, then display
+        b32 = pyotp.random_base32()
         totp = pyotp.totp.TOTP(b32)
         print(username)
         print(hashed)
         print(b32)
         #print(totp.provisioning_uri(username, issuer_name=serverName))
         exit(0)
-   
+
     main()
-    
